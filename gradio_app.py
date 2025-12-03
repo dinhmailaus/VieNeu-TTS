@@ -5,6 +5,9 @@ import torch
 from vieneu_tts import VieNeuTTS
 import os
 import time
+import numpy as np
+
+from infer_long_text import split_text_into_chunks
 
 print("⏳ Đang khởi động VieNeu-TTS...")
 
@@ -63,55 +66,81 @@ def load_reference_info(voice_choice):
     return None, ""
 
 def synthesize_speech(text, voice_choice, custom_audio, custom_text, mode_tab):
+    """
+    Tổng hợp giọng nói, hỗ trợ văn bản dài bằng cách tự động chia nhỏ (chunk)
+    tương tự logic trong infer_long_text.py.
+    """
     try:
-        if not text or text.strip() == "":
+        raw_text = (text or "").strip()
+        if not raw_text:
             return None, "⚠️ Vui lòng nhập văn bản cần tổng hợp!"
-        
-        # --- LOGIC CHECK LIMIT 250 ---
-        if len(text) > 250:
-            return None, f"❌ Văn bản quá dài ({len(text)}/250 ký tự)! Vui lòng cắt ngắn lại để đảm bảo chất lượng."
+
+        # Giới hạn an toàn cho UI (có thể tăng nếu cần)
+        MAX_UI_CHARS = 4000
+        if len(raw_text) > MAX_UI_CHARS:
+            return None, f"❌ Văn bản quá dài ({len(raw_text)}/{MAX_UI_CHARS} ký tự)! Vui lòng rút gọn bớt."
 
         # Logic chọn Reference
-        if mode_tab == "custom_mode": 
+        if mode_tab == "custom_mode":
             if custom_audio is None or not custom_text:
                 return None, "⚠️ Vui lòng tải lên Audio và nhập nội dung Audio đó."
             ref_audio_path = custom_audio
             ref_text_raw = custom_text
             print("🎨 Mode: Custom Voice")
-        else: # Preset
+        else:  # Preset
             if voice_choice not in VOICE_SAMPLES:
-                 return None, "⚠️ Vui lòng chọn một giọng mẫu."
+                return None, "⚠️ Vui lòng chọn một giọng mẫu."
             ref_audio_path = VOICE_SAMPLES[voice_choice]["audio"]
             ref_text_path = VOICE_SAMPLES[voice_choice]["text"]
-            
+
             if not os.path.exists(ref_audio_path):
-                 return None, f"❌ Không tìm thấy file audio: {ref_audio_path}"
-                 
+                return None, f"❌ Không tìm thấy file audio: {ref_audio_path}"
+
             with open(ref_text_path, "r", encoding="utf-8") as f:
                 ref_text_raw = f.read()
             print(f"🎤 Mode: Preset Voice ({voice_choice})")
 
+        # Chuẩn bị chunk cho văn bản dài
+        MAX_CHARS_PER_CHUNK = 256
+        chunks = split_text_into_chunks(raw_text, max_chars=MAX_CHARS_PER_CHUNK)
+        if not chunks:
+            return None, "❌ Không thể tách văn bản thành các đoạn hợp lệ."
+
+        print(f"📝 Tổng số đoạn: {len(chunks)} (≤ {MAX_CHARS_PER_CHUNK} ký tự mỗi đoạn)")
+        print(f"📝 Preview đoạn 1: {chunks[0][:80]}..." if chunks else "")
+
         # Inference & Đo thời gian
-        print(f"📝 Text: {text[:50]}...")
-        
-        start_time = time.time() # <--- Bắt đầu bấm giờ
-        
+        start_time = time.time()  # <--- Bắt đầu bấm giờ
+
+        # Mã hoá reference 1 lần
         ref_codes = tts.encode_reference(ref_audio_path)
-        wav = tts.infer(text, ref_codes, ref_text_raw)
-        
-        end_time = time.time()   # <--- Kết thúc bấm giờ
-        process_time = end_time - start_time # <--- Tính thời gian xử lý
-        
+
+        wav_segments = []
+        for idx, chunk in enumerate(chunks, start=1):
+            print(f"🎙️ Đang tổng hợp đoạn {idx}/{len(chunks)} | {len(chunk)} ký tự")
+            wav_chunk = tts.infer(chunk, ref_codes, ref_text_raw)
+            wav_segments.append(wav_chunk)
+
+        # Ghép tất cả đoạn lại
+        wav = np.concatenate(wav_segments, axis=0)
+
+        end_time = time.time()  # <--- Kết thúc bấm giờ
+        process_time = end_time - start_time  # <--- Tính thời gian xử lý
+
         # Save
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
             sf.write(tmp_file.name, wav, 24000)
             output_path = tmp_file.name
-        
+
         # <--- Cập nhật thông báo kết quả
-        return output_path, f"✅ Thành công! (Mất {process_time:.2f} giây để tạo)"
+        return (
+            output_path,
+            f"✅ Thành công! {len(chunks)} đoạn, mất {process_time:.2f} giây để tạo.",
+        )
 
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         return None, f"❌ Lỗi hệ thống: {str(e)}"
 
@@ -275,16 +304,17 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS Studio") as demo:
 
     # --- LOGIC ---
     def update_count(text):
-        l = len(text)
-        if l > 250:
-            color = "#dc2626" # Red
-            msg = f"⚠️ <b>{l} / 250</b> - Quá giới hạn!"
-        elif l > 200:
-            color = "#ea580c" # Orange
-            msg = f"{l} / 250"
+        MAX_UI_CHARS = 4000
+        l = len(text or "")
+        if l > MAX_UI_CHARS:
+            color = "#dc2626"  # Red
+            msg = f"⚠️ <b>{l} / {MAX_UI_CHARS}</b> - Quá giới hạn!"
+        elif l > int(0.8 * MAX_UI_CHARS):
+            color = "#ea580c"  # Orange
+            msg = f"{l} / {MAX_UI_CHARS}"
         else:
-            color = "#64748B" # Gray
-            msg = f"{l} / 250 ký tự"
+            color = "#64748B"  # Gray
+            msg = f"{l} / {MAX_UI_CHARS} ký tự"
         return f"<div style='text-align: right; color: {color}; font-size: 0.8rem; font-weight: bold'>{msg}</div>"
 
     text_input.change(update_count, text_input, char_count)
@@ -314,5 +344,5 @@ if __name__ == "__main__":
     demo.queue().launch(
         server_name="127.0.0.1", 
         server_port=7860, 
-        share=False
+        share=True
     )
